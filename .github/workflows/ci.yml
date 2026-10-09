@@ -10,4 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 --version
+      - name: Instalar Black
+        run: python3 -m pip install black
+      - name: Formatar código
+        run: python3 -m black --check .
       - run: python3 -m py_compile function_app.py
