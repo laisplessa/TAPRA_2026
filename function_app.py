@@ -13,7 +13,9 @@ import pyodbc
 app = func.FunctionApp()
 
 
-def log_db_details(sql_server: str, sql_database: str, sql_user: str, sql_pass: str) -> None:
+def log_db_details(
+    sql_server: str, sql_database: str, sql_user: str, sql_pass: str
+) -> None:
     logging.info(
         "servidor=%s, banco de dados=%s, usuario=%s, senha=%s",
         sql_server,
