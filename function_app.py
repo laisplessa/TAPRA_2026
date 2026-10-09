@@ -36,7 +36,7 @@ def extract_chamado(myTimer: func.TimerRequest) -> None:
         "TrustServerCertificate=no;"
         "Connection Timeout=30;"
     )
-
+swadbhnjifbeagrrVNKDl czxsgamj cgwvhe xcwrhb xvnjm
 
     try:
         # Estabelece a conexão com o banco de dados usando pyodbc
