@@ -5,8 +5,9 @@
 # Please refer to https://aka.ms/azure-functions-python-blueprints
 
 import logging
-import azure.functions as func
 import os
+
+import azure.functions as func
 import pyodbc
 
 app = func.FunctionApp()
