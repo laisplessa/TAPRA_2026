@@ -12,20 +12,18 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 import azure.functions as func
 import pyodbc
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient
+from azure.storage.filedatalake import DataLakeServiceClient
 
 app = func.FunctionApp()
 
 SOURCE_NAME = "itsm"
 SOURCE_SCHEMA = "itsm"
+BRONZE_CONTAINER = "bronze"
 FETCH_BATCH_SIZE = 5000
-
-_blob_service_client: Optional[BlobServiceClient] = None
 
 
 def get_connection_string() -> str:
@@ -48,40 +46,7 @@ def get_connection_string() -> str:
     )
 
 
-def get_blob_service_client() -> BlobServiceClient:
-    """Cria (uma vez) o client do Blob Storage.
-
-    Usa BRONZE_STORAGE_CONNECTION_STRING se existir (ex.: desenvolvimento local).
-    Caso contrario, usa BRONZE_STORAGE_ACCOUNT_URL com Managed Identity
-    (DefaultAzureCredential). A identidade precisa do papel
-    "Storage Blob Data Contributor" na conta de armazenamento.
-    """
-    global _blob_service_client
-
-    if _blob_service_client is not None:
-        return _blob_service_client
-
-    connection_string = os.getenv("BRONZE_STORAGE_CONNECTION_STRING")
-    if connection_string:
-        _blob_service_client = BlobServiceClient.from_connection_string(
-            connection_string
-        )
-        return _blob_service_client
-
-    account_url = os.getenv("BRONZE_STORAGE_ACCOUNT_URL")
-    if not account_url:
-        raise RuntimeError(
-            "Defina BRONZE_STORAGE_ACCOUNT_URL (Managed Identity) ou "
-            "BRONZE_STORAGE_CONNECTION_STRING."
-        )
-
-    _blob_service_client = BlobServiceClient(
-        account_url=account_url, credential=DefaultAzureCredential()
-    )
-    return _blob_service_client
-
-
-def build_blob_path(source: str, entity: str, extracted_at: dt.datetime) -> str:
+def build_file_path(source: str, entity: str, extracted_at: dt.datetime) -> str:
     """Monta o caminho no formato:
     <fonte>/<entidade>/ano=YYYY/mes=MM/dia=DD/<entidade>_YYYYMMDDTHHMMSSZ.json
     """
@@ -132,7 +97,12 @@ def rows_to_json_stream(cursor: pyodbc.Cursor) -> tuple[io.BytesIO, int]:
     return buffer, total
 
 
-def extract_table(table_name: str) -> None:
+def extract_table(table_name: str, entity: str | None = None) -> None:
+    """Extrai itsm.<table_name> e grava em bronze/itsm/<entity>/...
+
+    Se `entity` nao for informado, usa o proprio nome da tabela.
+    """
+    entity = entity or table_name
     extracted_at = dt.datetime.now(dt.timezone.utc)
     logging.info("Iniciando extracao da tabela %s.%s", SOURCE_SCHEMA, table_name)
 
@@ -146,17 +116,19 @@ def extract_table(table_name: str) -> None:
         logging.error("Erro ao ler %s.%s: %s", SOURCE_SCHEMA, table_name, exc)
         raise
 
-    container = os.getenv("BRONZE_CONTAINER", "bronze")
-    blob_path = build_blob_path(SOURCE_NAME, table_name, extracted_at)
+    file_path = build_file_path(SOURCE_NAME, entity, extracted_at)
 
     try:
-        blob_client = get_blob_service_client().get_blob_client(
-            container=container, blob=blob_path
+        # Cria o cliente do Data Lake e grava o arquivo no container bronze
+        datalake = DataLakeServiceClient.from_connection_string(
+            os.getenv("DATALAKE_CONNECTION_STRING")
         )
-        blob_client.upload_blob(payload, overwrite=False)
-        logging.info("Arquivo gravado em %s/%s", container, blob_path)
+        file_system = datalake.get_file_system_client(BRONZE_CONTAINER)
+        file_client = file_system.get_file_client(file_path)
+        file_client.upload_data(payload, overwrite=True)
+        logging.info("Arquivo gravado em %s/%s", BRONZE_CONTAINER, file_path)
     except Exception as exc:
-        logging.error("Erro ao gravar %s/%s: %s", container, blob_path, exc)
+        logging.error("Erro ao gravar %s/%s: %s", BRONZE_CONTAINER, file_path, exc)
         raise
 
 
@@ -167,7 +139,7 @@ def extract_table(table_name: str) -> None:
     use_monitor=False,
 )
 def extract_chamado(myTimer: func.TimerRequest) -> None:
-    extract_table("chamado")
+    extract_table("chamado", entity="chamados")
 
 
 @app.timer_trigger(
