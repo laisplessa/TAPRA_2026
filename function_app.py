@@ -45,6 +45,25 @@ def get_connection_string() -> str:
         "Connection Timeout=30;"
     )
 
+    def get_connection_string_destino() -> str:
+    sql_server = os.getenv("HOST_DESTINO")
+    sql_database = os.getenv("DB_DESTINO")
+    sql_user = os.getenv("USER_DESTINO")
+    sql_pass = os.getenv("PASSWORD_DESTINO")
+
+    logging.info("servidor=%s, banco de dados=%s", sql_server, sql_database)
+
+    return (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={sql_server};"
+        f"DATABASE={sql_database};"
+        f"UID={sql_user};"
+        f"PWD={sql_pass};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+
 
 def build_file_path(source: str, entity: str, extracted_at: dt.datetime) -> str:
     """Monta o caminho no formato:
