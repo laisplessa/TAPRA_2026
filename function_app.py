@@ -25,6 +25,21 @@ SOURCE_SCHEMA = "itsm"
 BRONZE_CONTAINER = "bronze"
 FETCH_BATCH_SIZE = 5000
 
+# Ordem de carga no banco de destino respeitando as chaves estrangeiras:
+# primeiro os cadastros ("pais"), depois as tabelas que dependem deles.
+LOAD_ORDER = [
+    "categoria",
+    "cliente_organizacao",
+    "fila",
+    "sla",
+    "analista",  # -> fila
+    "solicitante",  # -> cliente_organizacao
+    "chamado",  # -> analista, solicitante, categoria, cliente_organizacao, fila
+    "chamado_sla",  # -> chamado, sla
+    "chamado_status_historico",  # -> chamado, analista, fila
+    "csat_avaliacao",  # -> chamado, analista
+]
+
 
 def get_connection_string() -> str:
     sql_server = os.getenv("HOST")
@@ -45,13 +60,14 @@ def get_connection_string() -> str:
         "Connection Timeout=30;"
     )
 
-    def get_connection_string_destino() -> str:
+
+def get_connection_string_destino() -> str:
     sql_server = os.getenv("HOST_DESTINO")
     sql_database = os.getenv("DB_DESTINO")
     sql_user = os.getenv("USER_DESTINO")
     sql_pass = os.getenv("PASSWORD_DESTINO")
 
-    logging.info("servidor=%s, banco de dados=%s", sql_server, sql_database)
+    logging.info("destino: servidor=%s, banco de dados=%s", sql_server, sql_database)
 
     return (
         "DRIVER={ODBC Driver 18 for SQL Server};"
@@ -149,6 +165,100 @@ def extract_table(table_name: str, entity: str | None = None) -> None:
     except Exception as exc:
         logging.error("Erro ao gravar %s/%s: %s", BRONZE_CONTAINER, file_path, exc)
         raise
+
+
+def get_destination_columns(cursor: pyodbc.Cursor, table_name: str) -> set[str]:
+    """Retorna as colunas (em minusculo) da tabela no banco de destino."""
+    cursor.execute(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+        SOURCE_SCHEMA,
+        table_name,
+    )
+    return {row[0].lower() for row in cursor.fetchall()}
+
+
+def table_has_identity(cursor: pyodbc.Cursor, table_name: str) -> bool:
+    cursor.execute(
+        "SELECT OBJECTPROPERTY(OBJECT_ID(?), 'TableHasIdentity')",
+        f"{SOURCE_SCHEMA}.{table_name}",
+    )
+    return cursor.fetchone()[0] == 1
+
+
+def copy_table(
+    src_conn: pyodbc.Connection, dst_conn: pyodbc.Connection, table_name: str
+) -> int:
+    """Copia itsm.<table_name> da origem para o destino, mantendo os IDs."""
+    full_name = f"{SOURCE_SCHEMA}.{table_name}"
+    src_cursor = src_conn.cursor()
+    dst_cursor = dst_conn.cursor()
+    dst_cursor.fast_executemany = True
+
+    dst_columns = get_destination_columns(dst_cursor, table_name)
+    if not dst_columns:
+        raise RuntimeError(f"Tabela {full_name} nao existe no destino")
+    has_identity = table_has_identity(dst_cursor, table_name)
+
+    src_cursor.execute(f"SELECT * FROM {full_name}")
+    columns = [column[0] for column in src_cursor.description]
+    # So copia as colunas que existem nos dois bancos
+    keep = [i for i, name in enumerate(columns) if name.lower() in dst_columns]
+
+    columns_sql = ", ".join(f"[{columns[i]}]" for i in keep)
+    params_sql = ", ".join(["?"] * len(keep))
+    insert_sql = f"INSERT INTO {full_name} ({columns_sql}) VALUES ({params_sql})"
+
+    # IDENTITY_INSERT permite gravar os mesmos IDs da origem,
+    # mantendo os relacionamentos (FKs) entre as tabelas
+    if has_identity:
+        dst_cursor.execute(f"SET IDENTITY_INSERT {full_name} ON")
+
+    total = 0
+    while True:
+        batch = src_cursor.fetchmany(FETCH_BATCH_SIZE)
+        if not batch:
+            break
+        rows = [tuple(row[i] for i in keep) for row in batch]
+        dst_cursor.executemany(insert_sql, rows)
+        total += len(rows)
+
+    if has_identity:
+        dst_cursor.execute(f"SET IDENTITY_INSERT {full_name} OFF")
+
+    return total
+
+
+def load_destination() -> None:
+    """Recarga completa do banco de destino em uma unica transacao.
+
+    1. Apaga os dados das tabelas filhas para as pais (nao viola FKs).
+    2. Insere das tabelas pais para as filhas (LOAD_ORDER).
+    Se algo falhar, faz rollback e o destino continua com os dados anteriores.
+    """
+    logging.info("Iniciando carga do banco de destino")
+    src_conn = pyodbc.connect(get_connection_string())
+    dst_conn = pyodbc.connect(get_connection_string_destino(), autocommit=False)
+
+    try:
+        dst_cursor = dst_conn.cursor()
+        for table_name in reversed(LOAD_ORDER):
+            dst_cursor.execute(f"DELETE FROM {SOURCE_SCHEMA}.{table_name}")
+            logging.info("Destino %s limpo", table_name)
+
+        for table_name in LOAD_ORDER:
+            total = copy_table(src_conn, dst_conn, table_name)
+            logging.info("Destino %s: %s registros inseridos", table_name, total)
+
+        dst_conn.commit()
+        logging.info("Carga do banco de destino concluida")
+    except Exception:
+        dst_conn.rollback()
+        logging.exception("Erro na carga do destino; alteracoes desfeitas")
+        raise
+    finally:
+        src_conn.close()
+        dst_conn.close()
 
 
 @app.timer_trigger(
@@ -249,3 +359,15 @@ def extract_sla(myTimer: func.TimerRequest) -> None:
 )
 def extract_solicitante(myTimer: func.TimerRequest) -> None:
     extract_table("solicitante")
+
+
+# Atualiza o banco de destino uma vez por dia.
+# CRON (seg min hora dia mes dia_semana) em UTC: 06:00 UTC = 03:00 de Brasilia.
+@app.timer_trigger(
+    schedule="0 0 6 * * *",
+    arg_name="myTimer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def load_banco_destino(myTimer: func.TimerRequest) -> None:
+    load_destination()
